@@ -1,0 +1,20 @@
+version: "3.9"
+services:
+  web:
+    build: .
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+    environment:
+      TRENDING_PRODUCTS_HEADLESS: "true"
+      TRENDING_PRODUCTS_DATA: /app/data
+  scheduler:
+    build: .
+    command: python -c "from scheduler import start_scheduler; s = start_scheduler(); import time;\ntry:\n    while True:\n        time.sleep(60)\nexcept KeyboardInterrupt:\n    s.shutdown()"
+    volumes:
+      - ./:/app
+    environment:
+      TRENDING_PRODUCTS_HEADLESS: "true"
+      TRENDING_PRODUCTS_DATA: /app/data
