@@ -1,43 +1,50 @@
-"""Lightweight SQLite helpers for the trending product bot."""
+"""SQLite persistence layer for trending products bot."""
 from __future__ import annotations
 
-import csv
+import logging
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator, List, Mapping, MutableMapping, Optional
+from typing import Iterable, Optional
 
-from config import DATABASE_PATH
+from config import DATA_DIR
+from scrapers.base_scraper import ProductRecord
 
-Path(DATABASE_PATH).parent.mkdir(parents=True, exist_ok=True)
+LOGGER = logging.getLogger(__name__)
 
-
-@contextmanager
-def get_connection(path: Path | str = DATABASE_PATH) -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
+DB_PATH = DATA_DIR / "trending_products.sqlite3"
 
 
-def init_db(path: Path | str = DATABASE_PATH) -> None:
-    """Ensure the database schema exists."""
-    with get_connection(path) as conn:
+@dataclass(slots=True)
+class Product:
+    id: int
+    name: str
+    category: Optional[str]
+    first_seen: str
+    last_updated: str
+    trend_score: float
+    image_url: Optional[str]
+    status: str
+    notes: Optional[str]
+
+
+def init_db(path: Path = DB_PATH) -> None:
+    LOGGER.info("Initializing database at %s", path)
+    with sqlite3.connect(path) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                platform TEXT NOT NULL,
-                url TEXT NOT NULL UNIQUE,
-                image_url TEXT,
-                description TEXT,
+                category TEXT,
                 first_seen TEXT NOT NULL,
-                last_seen TEXT NOT NULL,
-                trend_score REAL NOT NULL DEFAULT 0
+                last_updated TEXT NOT NULL,
+                trend_score REAL NOT NULL DEFAULT 0,
+                image_url TEXT,
+                status TEXT NOT NULL DEFAULT 'new',
+                notes TEXT
             )
             """
         )
@@ -46,189 +53,150 @@ def init_db(path: Path | str = DATABASE_PATH) -> None:
             CREATE TABLE IF NOT EXISTS metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_id INTEGER NOT NULL,
-                captured_at TEXT NOT NULL,
+                date TEXT NOT NULL,
                 reviews INTEGER,
-                rating REAL,
                 orders INTEGER,
-                votes INTEGER,
                 price REAL,
-                comments INTEGER,
-                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+                currency TEXT,
+                social_mentions INTEGER,
+                FOREIGN KEY(product_id) REFERENCES products(id)
             )
             """
         )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_metrics_product ON metrics(product_id, captured_at DESC)"
+            """
+            CREATE TABLE IF NOT EXISTS sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                url TEXT NOT NULL,
+                found_at TEXT NOT NULL,
+                FOREIGN KEY(product_id) REFERENCES products(id)
+            )
+            """
         )
-        conn.commit()
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sources_platform ON sources(platform)")
+    LOGGER.info("Database initialized")
 
 
-def upsert_product(product: Mapping[str, object], *, conn: sqlite3.Connection) -> int:
-    """Insert or update a product row and return its id."""
+@contextmanager
+def get_conn(path: Path = DB_PATH):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def upsert_product(record: ProductRecord, *, conn: sqlite3.Connection) -> int:
+    cursor = conn.execute(
+        "SELECT id, trend_score, status FROM products WHERE name = ?",
+        (record.name,),
+    )
+    row = cursor.fetchone()
     now = datetime.utcnow().isoformat()
-    existing = conn.execute(
-        "SELECT id FROM products WHERE url = ?",
-        (str(product["url"]),),
-    ).fetchone()
-
-    if existing:
-        product_id = int(existing["id"])
+    if row:
+        product_id = row["id"]
+        trend_score = compute_trend_score(record, existing_score=row["trend_score"])
         conn.execute(
             """
             UPDATE products
-            SET name = ?, platform = ?, image_url = ?, description = ?, trend_score = ?, last_seen = ?
+            SET last_updated = ?, trend_score = ?, image_url = COALESCE(?, image_url)
             WHERE id = ?
             """,
+            (now, trend_score, record.image_url, product_id),
+        )
+    else:
+        trend_score = compute_trend_score(record)
+        cursor = conn.execute(
+            """
+            INSERT INTO products (name, category, first_seen, last_updated, trend_score, image_url, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
             (
-                product.get("name"),
-                product.get("platform"),
-                product.get("image_url"),
-                product.get("description"),
-                float(product.get("trend_score", 0)),
+                record.name,
+                record.metadata.get("category") if record.metadata else None,
                 now,
-                product_id,
+                now,
+                trend_score,
+                record.image_url,
+                "new",
             ),
         )
-        return product_id
-
-    cursor = conn.execute(
-        """
-        INSERT INTO products (name, platform, url, image_url, description, first_seen, last_seen, trend_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            product.get("name"),
-            product.get("platform"),
-            product.get("url"),
-            product.get("image_url"),
-            product.get("description"),
-            now,
-            now,
-            float(product.get("trend_score", 0)),
-        ),
-    )
-    return int(cursor.lastrowid)
+        product_id = cursor.lastrowid
+    LOGGER.debug("Upserted product %s -> id %s", record.name, product_id)
+    return product_id
 
 
-def add_metric(product_id: int, metrics: Mapping[str, object], *, conn: sqlite3.Connection) -> None:
-    """Persist a metrics snapshot for a product."""
+def add_metric(product_id: int, record: ProductRecord, *, conn: sqlite3.Connection) -> None:
     conn.execute(
         """
-        INSERT INTO metrics (product_id, captured_at, reviews, rating, orders, votes, price, comments)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO metrics (product_id, date, reviews, orders, price, currency, social_mentions)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             product_id,
-            metrics.get("captured_at", datetime.utcnow().isoformat()),
-            _safe_int(metrics.get("reviews")),
-            _safe_float(metrics.get("rating")),
-            _safe_int(metrics.get("orders")),
-            _safe_int(metrics.get("votes")),
-            _safe_float(metrics.get("price")),
-            _safe_int(metrics.get("comments")),
+            datetime.utcnow().date().isoformat(),
+            record.reviews,
+            record.orders,
+            record.price,
+            record.currency,
+            record.metadata.get("social_mentions") if record.metadata else None,
         ),
     )
 
 
-def record_products(products: Iterable[MutableMapping[str, object]], path: Path | str = DATABASE_PATH) -> None:
-    """Persist a collection of product payloads and associated metrics."""
-    with get_connection(path) as conn:
-        for payload in products:
-            metrics = payload.get("metrics", {})
-            product_fields = {k: v for k, v in payload.items() if k != "metrics"}
-            product_id = upsert_product(product_fields, conn=conn)
-            if metrics:
-                metrics.setdefault("captured_at", datetime.utcnow().isoformat())
-                add_metric(product_id, metrics, conn=conn)
+def add_source(product_id: int, record: ProductRecord, *, conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        INSERT INTO sources (product_id, platform, url, found_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            product_id,
+            record.platform,
+            record.url,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+
+
+def persist_records(records: Iterable[ProductRecord], path: Path = DB_PATH) -> None:
+    if not records:
+        return
+    with get_conn(path) as conn:
+        for record in records:
+            product_id = upsert_product(record, conn=conn)
+            add_metric(product_id, record, conn=conn)
+            add_source(product_id, record, conn=conn)
         conn.commit()
 
 
-def fetch_products(path: Path | str = DATABASE_PATH) -> List[sqlite3.Row]:
-    """Return all products with their latest metrics snapshot."""
-    with get_connection(path) as conn:
-        rows = conn.execute(
-            """
-            SELECT p.id, p.name, p.platform, p.url, p.image_url, p.description,
-                   p.first_seen, p.last_seen, p.trend_score,
-                   m.reviews, m.rating, m.orders, m.votes, m.price, m.comments, m.captured_at
-            FROM products AS p
-            LEFT JOIN metrics AS m ON m.id = (
-                SELECT id FROM metrics WHERE product_id = p.id ORDER BY captured_at DESC, id DESC LIMIT 1
-            )
-            ORDER BY p.last_seen DESC
-            """
-        ).fetchall()
-    return list(rows)
+def compute_trend_score(record: ProductRecord, existing_score: float | None = None) -> float:
+    base_score = existing_score or 0
+    score = base_score * 0.7
+    reviews = record.reviews or 0
+    orders = record.orders or 0
+    badges = len(record.badges or [])
+    rating = record.rating or 0
+
+    score += min(reviews / 100, 40)
+    score += min(orders / 50, 30)
+    score += badges * 5
+    score += (rating / 5) * 10
+    if record.metadata:
+        if record.metadata.get("source_url", "").startswith("https://www.reddit.com"):
+            score += 5
+    return round(min(score, 100), 2)
 
 
-def fetch_metrics_for_product(product_id: int, *, limit: int = 30, path: Path | str = DATABASE_PATH) -> List[sqlite3.Row]:
-    with get_connection(path) as conn:
-        rows = conn.execute(
-            """
-            SELECT captured_at, reviews, rating, orders, votes, price, comments
-            FROM metrics
-            WHERE product_id = ?
-            ORDER BY captured_at ASC
-            LIMIT ?
-            """,
-            (product_id, limit),
-        ).fetchall()
-    return list(rows)
-
-
-def export_products_to_csv(file_obj, path: Path | str = DATABASE_PATH) -> None:
-    """Write product data and latest metrics to a CSV file-like object."""
-    rows = fetch_products(path)
-    if not rows:
-        return
-
-    writer = csv.writer(file_obj)
-    writer.writerow(
-        [
-            "id",
-            "name",
-            "platform",
-            "url",
-            "trend_score",
-            "reviews",
-            "rating",
-            "orders",
-            "votes",
-            "price",
-            "comments",
-            "first_seen",
-            "last_seen",
-        ]
-    )
-    for row in rows:
-        writer.writerow(
-            [
-                row["id"],
-                row["name"],
-                row["platform"],
-                row["url"],
-                row["trend_score"],
-                row["reviews"],
-                row["rating"],
-                row["orders"],
-                row["votes"],
-                row["price"],
-                row["comments"],
-                row["first_seen"],
-                row["last_seen"],
-            ]
+def update_status(product_id: int, status: str, notes: str | None = None) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE products SET status = ?, notes = COALESCE(?, notes) WHERE id = ?",
+            (status, notes, product_id),
         )
+        conn.commit()
 
-
-def _safe_int(value: object | None) -> Optional[int]:
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _safe_float(value: object | None) -> Optional[float]:
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None

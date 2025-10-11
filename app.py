@@ -1,15 +1,110 @@
-"""Streamlit dashboard for the lightweight trending product bot."""
+"""Streamlit dashboard for visualizing trending products."""
 from __future__ import annotations
 
-import csv
-from datetime import date, datetime
-from io import StringIO
-from typing import Dict, Iterable, List
+import logging
+from datetime import date
+from typing import List, Optional
 
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-from database import fetch_metrics_for_product, fetch_products, init_db
-from run_scrapers import run_all
+from database import DB_PATH, get_conn, init_db, update_status
+from scheduler import run_once
+
+logging.basicConfig(level=logging.INFO)
+
+STATUS_OPTIONS = ["new", "researching", "ordered samples", "testing", "live", "pass", "saturated"]
+
+
+@st.cache_data(show_spinner=False)
+def load_products(start_date: Optional[date] = None, end_date: Optional[date] = None,
+                 platforms: Optional[List[str]] = None,
+                 min_score: float = 0.0) -> pd.DataFrame:
+    with get_conn(DB_PATH) as conn:
+        query = (
+            """
+            SELECT p.id, p.name, p.category, p.first_seen, p.last_updated, p.trend_score,
+                   p.image_url, p.status, p.notes,
+                   GROUP_CONCAT(DISTINCT s.platform) AS platforms,
+                   GROUP_CONCAT(DISTINCT s.url) AS source_urls
+            FROM products p
+            LEFT JOIN sources s ON s.product_id = p.id
+            GROUP BY p.id
+            HAVING trend_score >= ?
+            """
+        )
+        params: List[object] = [min_score]
+        if platforms:
+            query += " AND (" + " OR ".join("platforms LIKE ?" for _ in platforms) + ")"
+            params.extend([f"%{platform}%" for platform in platforms])
+        if start_date:
+            query += " AND date(first_seen) >= ?"
+            params.append(start_date.isoformat())
+        if end_date:
+            query += " AND date(last_updated) <= ?"
+            params.append(end_date.isoformat())
+        df = pd.read_sql_query(query, conn, params=params)
+    if not df.empty:
+        df["platform_list"] = df["platforms"].fillna("").apply(lambda x: list(filter(None, x.split(","))))
+    return df
+
+
+def load_metrics(product_id: int) -> pd.DataFrame:
+    with get_conn(DB_PATH) as conn:
+        df = pd.read_sql_query(
+            "SELECT date, reviews, orders, price FROM metrics WHERE product_id = ? ORDER BY date ASC",
+            conn,
+            params=[product_id],
+        )
+    return df
+
+
+def render_gauge(score: float) -> go.Figure:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score,
+        gauge={"axis": {"range": [0, 100]}, "bar": {"color": "#FF4B4B"}},
+    ))
+    fig.update_layout(height=250, margin=dict(l=10, r=10, t=10, b=10))
+    return fig
+
+
+def render_product_card(row: pd.Series) -> None:
+    st.markdown("---")
+    cols = st.columns([1, 3])
+    if row.image_url:
+        cols[0].image(row.image_url, use_column_width=True)
+    cols[1].markdown(f"### {row.name}")
+    cols[1].plotly_chart(render_gauge(row.trend_score), use_container_width=True)
+    platforms = row.get("platform_list", [])
+    badge_text = " ".join(f"`{platform}`" for platform in platforms)
+    cols[1].markdown(f"Platforms: {badge_text or 'N/A'}")
+    if row.source_urls:
+        for url in set(row.source_urls.split(",")):
+            cols[1].markdown(f"[Source Link]({url})")
+    with st.expander("Trend Metrics"):
+        metrics_df = load_metrics(row.id)
+        if metrics_df.empty:
+            st.info("No metrics captured yet.")
+        else:
+            metrics_df["date"] = pd.to_datetime(metrics_df["date"])
+            fig = px.line(metrics_df, x="date", y=["reviews", "orders", "price"], markers=True)
+            st.plotly_chart(fig, use_container_width=True)
+    with st.expander("Notes & Status"):
+        default_index = STATUS_OPTIONS.index(row.status) if row.status in STATUS_OPTIONS else 0
+        status = st.selectbox("Status", STATUS_OPTIONS, index=default_index, key=f"status_{row.id}")
+        notes = st.text_area("Notes", value=row.notes or "", key=f"notes_{row.id}")
+        if st.button("Save", key=f"save_{row.id}"):
+            update_status(row.id, status, notes)
+            st.success("Updated status")
+            st.cache_data.clear()
+
+
+def render_table(df: pd.DataFrame) -> None:
+    table_df = df[["name", "trend_score", "category", "status", "first_seen", "last_updated", "platforms"]]
+    st.dataframe(table_df.sort_values(by="trend_score", ascending=False), use_container_width=True)
 
 
 def main() -> None:
@@ -17,195 +112,50 @@ def main() -> None:
     st.title("Trending Product Radar")
     init_db()
 
-    if "last_run" not in st.session_state:
-        st.session_state["last_run"] = None
-
-    products = _load_products()
-
     with st.sidebar:
-        st.header("Controls")
-        if st.button("Run Scrapers"):
-            with st.spinner("Running scrapers..."):
-                results = run_all()
-                st.session_state["last_run"] = datetime.utcnow().isoformat()
-                st.success(f"Captured {len(results)} results")
-                products = _load_products()
+        st.header("Scraper Controls")
+        if st.button("Run Scrapers Now"):
+            with st.spinner("Scraping..."):
+                run_once()
+                st.cache_data.clear()
+                st.success("Scrape completed")
+        st.write(f"Database: {DB_PATH}")
+
         st.header("Filters")
-        platform_options = sorted({item["platform"] for item in products if item.get("platform")})
-        min_score = st.slider("Minimum Trend Score", 0, 100, value=40)
-        selected_platforms = st.multiselect("Platforms", options=platform_options)
+        min_score = st.slider("Minimum Trend Score", 0, 100, value=50)
+        start_date = st.date_input("Start Date", value=None)
+        end_date = st.date_input("End Date", value=None)
+        selected_platforms = st.multiselect("Platforms", ["amazon", "aliexpress", "reddit"])
 
-        use_start = st.checkbox("Filter by first seen date")
-        start_date = st.date_input(
-            "First Seen On/After",
-            value=date.today(),
-            disabled=not use_start,
-        )
-        if not use_start:
-            start_date = None
+    df = load_products(start_date=start_date or None, end_date=end_date or None,
+                       platforms=selected_platforms or None, min_score=float(min_score))
 
-        use_end = st.checkbox("Filter by last seen date")
-        end_date = st.date_input(
-            "Last Seen On/Before",
-            value=date.today(),
-            disabled=not use_end,
-        )
-        if not use_end:
-            end_date = None
-
-    filtered = _filter_products(products, selected_platforms, min_score, start_date, end_date)
-
-    st.subheader("Trending Products")
-    if not filtered:
-        st.info("No products available yet. Run the scrapers to gather data.")
+    st.subheader("Ranked Trending Products")
+    if df.empty:
+        st.info("No products available yet. Trigger a scrape to populate data.")
     else:
-        st.dataframe(
-            [
-                {
-                    "Name": item["name"],
-                    "Platform": item["platform"],
-                    "Trend Score": item["trend_score"],
-                    "Reviews": item.get("reviews"),
-                    "Orders": item.get("orders"),
-                    "Votes": item.get("votes"),
-                    "First Seen": item.get("first_seen"),
-                    "Last Seen": item.get("last_seen"),
-                }
-                for item in filtered
-            ],
-            use_container_width=True,
-        )
-        st.download_button(
-            "Download Filtered CSV",
-            data=_build_csv(filtered),
-            file_name="trending_products_filtered.csv",
-            mime="text/csv",
-        )
-
+        render_table(df)
         st.subheader("Product Highlights")
-        for product in filtered:
-            _render_product_card(product)
+        for _, row in df.iterrows():
+            render_product_card(row)
 
-    if st.session_state["last_run"]:
-        st.caption(f"Last scraper run: {st.session_state['last_run']}")
+    st.subheader("History & Exclusions")
+    if not df.empty:
+        history_df = df[df["status"].isin(["pass", "saturated"])]
+        if history_df.empty:
+            st.info("No historical exclusions yet.")
+        else:
+            st.dataframe(history_df[["name", "status", "notes", "last_updated"]])
 
-
-def _load_products() -> List[Dict[str, object]]:
-    rows = fetch_products()
-    return [dict(row) for row in rows]
-
-
-def _filter_products(
-    products: Iterable[Dict[str, object]],
-    platforms: List[str],
-    min_score: int,
-    start: date | None,
-    end: date | None,
-) -> List[Dict[str, object]]:
-    filtered: List[Dict[str, object]] = []
-    for product in products:
-        if platforms and product.get("platform") not in platforms:
-            continue
-        if product.get("trend_score", 0) < min_score:
-            continue
-        first_seen = _to_date(product.get("first_seen"))
-        last_seen = _to_date(product.get("last_seen"))
-        if start and first_seen and first_seen < start:
-            continue
-        if end and last_seen and last_seen > end:
-            continue
-        filtered.append(product)
-    return filtered
-
-
-def _render_product_card(product: Dict[str, object]) -> None:
-    st.markdown("---")
-    left, right = st.columns([1, 3])
-    if product.get("image_url"):
-        left.image(product["image_url"], use_column_width=True)
-    left.metric("Trend Score", f"{product.get('trend_score', 0):.1f}")
-
-    right.markdown(f"### {product['name']}")
-    right.markdown(f"**Platform:** {product['platform']}")
-    if product.get("url"):
-        right.markdown(f"[Open listing]({product['url']})")
-
-    metrics_summary = []
-    reviews = _safe_int(product.get("reviews"))
-    if reviews:
-        metrics_summary.append(f"{reviews} reviews")
-    orders = _safe_int(product.get("orders"))
-    if orders:
-        metrics_summary.append(f"{orders} orders")
-    votes = _safe_int(product.get("votes"))
-    if votes:
-        metrics_summary.append(f"{votes} votes")
-    if metrics_summary:
-        right.markdown(" | ".join(metrics_summary))
-
-    history = fetch_metrics_for_product(product["id"], limit=25)
-    if history:
-        chart_data = {
-            "Reviews": [row["reviews"] or 0 for row in history],
-            "Orders": [row["orders"] or 0 for row in history],
-            "Votes": [row["votes"] or 0 for row in history],
-        }
-        if any(sum(series) for series in chart_data.values()):
-            right.line_chart(chart_data)
-
-
-def _build_csv(products: Iterable[Dict[str, object]]) -> str:
-    buffer = StringIO()
-    writer = csv.writer(buffer)
-    writer.writerow(
-        [
-            "id",
-            "name",
-            "platform",
-            "url",
-            "trend_score",
-            "reviews",
-            "orders",
-            "votes",
-            "first_seen",
-            "last_seen",
-        ]
-    )
-    for item in products:
-        writer.writerow(
-            [
-                item.get("id"),
-                item.get("name"),
-                item.get("platform"),
-                item.get("url"),
-                item.get("trend_score"),
-                item.get("reviews"),
-                item.get("orders"),
-                item.get("votes"),
-                item.get("first_seen"),
-                item.get("last_seen"),
-            ]
-        )
-    return buffer.getvalue()
-
-
-def _safe_int(value: object | None) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(str(value).replace(",", ""))
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_date(value: object) -> date | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value)).date()
-    except ValueError:
-        return None
+    st.subheader("Error Logs")
+    log_path = DB_PATH.parent / "scraper.log"
+    if log_path.exists():
+        st.download_button("Download Log", data=log_path.read_text(encoding="utf-8"), file_name="scraper.log")
+        st.text(log_path.read_text(encoding="utf-8")[-4000:])
+    else:
+        st.info("No errors logged yet.")
 
 
 if __name__ == "__main__":
     main()
+

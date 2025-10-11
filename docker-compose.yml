@@ -10,9 +10,9 @@ services:
     environment:
       TRENDING_PRODUCTS_HEADLESS: "true"
       TRENDING_PRODUCTS_DATA: /app/data
-  scraper:
+  scheduler:
     build: .
-    command: python run_scrapers.py --schedule 12
+    command: python -c "from scheduler import start_scheduler; s = start_scheduler(); import time;\ntry:\n    while True:\n        time.sleep(60)\nexcept KeyboardInterrupt:\n    s.shutdown()"
     volumes:
       - ./:/app
     environment:

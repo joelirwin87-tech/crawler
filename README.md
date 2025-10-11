@@ -1,103 +1,126 @@
-# Trending Product Radar (Lightweight Edition)
+# Trending Products Bot
 
-This project tracks early-stage trending products using Selenium-powered scrapers and a Streamlit dashboard. It focuses on three reliable, scrape-friendly sources—Amazon Movers & Shakers, AliExpress trending listings, and Reddit's r/shutupandtakemymoney—and stores results in a compact SQLite database.
-
-The implementation prioritises macOS compatibility and minimal dependencies: only Selenium, undetected-chromedriver, BeautifulSoup, Requests, Streamlit, and Schedule are required.
+A modular Selenium-based scraping system and Streamlit dashboard that tracks trending e-commerce products before they become saturated. The bot focuses on platforms such as Amazon Movers & Shakers, AliExpress New Arrivals, and Reddit rising posts, and can be extended to additional sources.
 
 ## Features
 
-- **Selenium scrapers** for Amazon, AliExpress, and Reddit with randomised delays, rotating user agents, and headless support.
-- **Lightweight SQLite persistence** using Python's built-in `sqlite3` module (no ORMs or external DB drivers).
-- **Simple trend scoring** based on reviews, orders, and engagement to highlight low-saturation opportunities.
-- **Streamlit dashboard** offering filtering, sortable tables, quick product cards, and CSV export of the current view.
-- **Manual or scheduled execution** via a helper script that uses the `schedule` library or cron/launchd on macOS.
+- **Selenium Scrapers** using `undetected-chromedriver` with random delays, user-agent rotation, optional proxies, and debugging artefacts (screenshots + HTML).
+- **Anti-saturation heuristics** including review/order thresholds and rating filters.
+- **SQLite persistence layer** with product, metric, and source tables.
+- **APScheduler integration** for automated background scraping.
+- **Streamlit dashboard** offering ranked tables, product cards, manual tagging, notes, Plotly trend charts, and log downloads.
+- **Extensible architecture** to add new scrapers and metrics.
 
 ## Project Structure
 
 ```
-/crawler
-├── app.py               # Streamlit dashboard
-├── config.py            # Scraper configuration and settings
-├── database.py          # SQLite helpers
-├── run_scrapers.py      # Manual/scheduled scraper runner
-├── requirements.txt     # Minimal dependency set
+/trending-products-bot
+├── app.py                   # Streamlit dashboard
+├── config.py                # Global configuration and selectors
+├── database.py              # SQLite schema and persistence helpers
+├── scheduler.py             # APScheduler wrapper for scraping jobs
 ├── scrapers/
-│   ├── __init__.py      # Selenium session utilities
-│   ├── aliexpress.py    # AliExpress trending scraper
-│   ├── amazon.py        # Amazon Movers & Shakers scraper
-│   └── reddit.py        # Reddit product discussion scraper
+│   ├── __init__.py
+│   ├── base_scraper.py      # Shared Selenium logic
+│   ├── amazon_scraper.py    # Amazon Movers & Shakers + New Releases
+│   ├── aliexpress_scraper.py# AliExpress hot/new arrivals
+│   └── reddit_scraper.py    # Reddit rising posts
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
 └── README.md
 ```
 
 ## Prerequisites
 
-- Python 3.12+
-- Google Chrome or Chromium installed locally (Selenium requirement)
-- macOS, Linux, or Windows host with the ability to run Chrome in headless mode
+- Python 3.11+
+- Google Chrome/Chromium installed on the host (required by Selenium)
+- Optional: Docker & Docker Compose
 
 ## Installation
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Running Scrapers
-
-Perform a single scrape across all sources:
+## Running the Scrapers Once
 
 ```bash
-python run_scrapers.py
+python -m scheduler
 ```
 
-To keep scraping on a simple interval using the bundled scheduler:
+The command initialises the database (if necessary), runs each scraper sequentially, and persists results to `data/trending_products.sqlite3`.
 
-```bash
-python run_scrapers.py --schedule 12  # runs every 12 hours
-```
-
-For production automation on macOS, use `cron` or `launchd` to execute `python run_scrapers.py` at your preferred cadence.
-
-## Launching the Dashboard
+## Streamlit Dashboard
 
 ```bash
 streamlit run app.py
 ```
 
-Dashboard highlights:
+Dashboard capabilities include:
 
-- Sidebar controls to trigger scrapes, filter by platform, minimum trend score, or date range
-- Ranked table of products with current review/order/vote counts
-- Product cards with quick metrics and simple Streamlit charts
-- One-click CSV export of the filtered dataset
+- Ranked list sorted by trend score
+- Product cards with gauges, platform badges, Plotly charts, notes & status management
+- Manual scraper trigger and log viewer
+- History tab filtering for "pass"/"saturated" products
 
-## Configuration
+## Scheduler as a Service
 
-The defaults in `config.py` can be overridden with environment variables:
+To run scrapers on a schedule, use the helper functions in `scheduler.py` from a Python entrypoint:
+
+```python
+from scheduler import start_scheduler
+
+if __name__ == "__main__":
+    scheduler = start_scheduler()
+    try:
+        while True:
+            pass
+    except KeyboardInterrupt:
+        scheduler.shutdown()
+```
+
+Each scraper runs at an interval defined in `config.SCRAPE_INTERVAL_HOURS`. Intervals can be customised via environment variables such as `SCRAPE_INTERVAL_AMAZON`.
+
+## Environment Configuration
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `TRENDING_PRODUCTS_DATA` | Output directory for SQLite database | `./data` |
-| `TRENDING_PRODUCTS_HEADLESS` | Set to `false` to show the browser | `true` |
-| `TRENDING_PRODUCTS_TIMEOUT` | Page load timeout in seconds | `45` |
-| `TRENDING_PRODUCTS_DELAY_MIN` | Minimum random delay between actions | `2` |
-| `TRENDING_PRODUCTS_DELAY_MAX` | Maximum random delay between actions | `5` |
-| `TRENDING_PRODUCTS_MAX_ITEMS` | Max products captured per source | `25` |
-| `TRENDING_PRODUCTS_AMAZON_URL` | Override Amazon movers URL | official movers page |
-| `TRENDING_PRODUCTS_ALIEXPRESS_URL` | Override AliExpress list URL | womens clothing trending |
-| `TRENDING_PRODUCTS_REDDIT_URL` | Override Reddit feed URL | `/r/shutupandtakemymoney/hot/` |
+| `TRENDING_PRODUCTS_DATA` | Output directory for DB and artefacts | `./data` |
+| `TRENDING_PRODUCTS_HEADLESS` | Set to `false` to disable headless mode | `true` |
+| `TRENDING_PRODUCTS_PROXY` | Proxy URL passed to Chrome | unset |
+| `TRENDING_PRODUCTS_DELAY_MIN` | Minimum random delay seconds | `2` |
+| `TRENDING_PRODUCTS_DELAY_MAX` | Maximum random delay seconds | `5` |
+| `SCRAPE_INTERVAL_AMAZON` | Hours between Amazon runs | `12` |
+| `SCRAPE_INTERVAL_ALIEXPRESS` | Hours between AliExpress runs | `12` |
+| `SCRAPE_INTERVAL_REDDIT` | Hours between Reddit runs | `24` |
 
-## Extending Scrapers
+## Docker Usage
 
-1. Copy an existing scraper in `scrapers/` and adjust selectors for the new source.
-2. Return dictionaries containing at least `name`, `url`, `platform`, and a `metrics` mapping (`reviews`, `orders`, `votes`, etc.).
-3. Register the scraper in `run_scrapers.py` alongside the others.
+Build and run using Docker Compose for reproducible deployments:
+
+```bash
+docker compose up --build
+```
+
+The `web` service serves the Streamlit dashboard on port 8501, while the `scheduler` service runs periodic scrapes.
+
+## Extending with New Scrapers
+
+1. Create a new module in `scrapers/` inheriting from `SeleniumScraper`.
+2. Add CSS selectors to `config.SELECTORS`.
+3. Implement a `parse` method returning `ProductRecord` instances.
+4. Register the scraper in `scheduler.SCRAPERS` and `config.SCRAPE_INTERVAL_HOURS`.
 
 ## Troubleshooting
 
-- **Chromedriver mismatches**: Ensure Chrome/Chromium is installed. `undetected-chromedriver` manages the driver binary automatically.
-- **CAPTCHA or blocked pages**: The scrapers log failures and skip the entry. Consider adding proxy rotation if needed.
-- **Empty dashboard**: Run `python run_scrapers.py` or use the Streamlit sidebar button to populate data.
+- **Chromedriver issues**: Ensure Chrome/Chromium is installed and matches the major version expected by `undetected-chromedriver`.
+- **CAPTCHA detection**: The scraper logs skipped pages; manual intervention may be required for persistent CAPTCHAs.
+- **Empty datasets**: Use the Streamlit sidebar button to trigger scrapes manually.
 
-Always respect each website's terms of service and scraping policies.
+## License
+
+This project is provided as-is for educational purposes. Ensure compliance with the Terms of Service of any website you scrape and respect `robots.txt` directives.
+
