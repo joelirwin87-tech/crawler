@@ -1,0 +1,20 @@
+version: "3.9"
+services:
+  web:
+    build: .
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+    environment:
+      TRENDING_PRODUCTS_HEADLESS: "true"
+      TRENDING_PRODUCTS_DATA: /app/data
+  scraper:
+    build: .
+    command: python run_scrapers.py --schedule 12
+    volumes:
+      - ./:/app
+    environment:
+      TRENDING_PRODUCTS_HEADLESS: "true"
+      TRENDING_PRODUCTS_DATA: /app/data
